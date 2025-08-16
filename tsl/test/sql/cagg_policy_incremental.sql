@@ -380,3 +380,63 @@ FROM
 REASSIGN OWNED BY test_cagg_refresh_policy_user TO :ROLE_CLUSTER_SUPERUSER;
 REVOKE ALL ON SCHEMA public FROM test_cagg_refresh_policy_user;
 DROP ROLE test_cagg_refresh_policy_user;
+
+--------------------------------------------
+--Timestime out of range issue
+
+CREATE TABLE test_metrics (
+    time TIMESTAMPTZ NOT NULL,
+    device_id INT,
+    value FLOAT
+);
+
+-- Set chunk time to 1 day
+SELECT create_hypertable('test_metrics', 'time', chunk_time_interval => INTERVAL '1 day');
+
+-- 2. Create a continuous aggregate with time_bucket
+CREATE MATERIALIZED VIEW test_cagg
+WITH (timescaledb.continuous) AS
+SELECT 
+    time_bucket('1 hour', time) AS bucket,
+    device_id,
+    avg(value) as avg_value
+FROM test_metrics
+GROUP BY 1, 2;
+
+INSERT INTO test_metrics (time, device_id, value)
+VALUES ('2025-08-05', 1, 10.0);
+
+-- 4. Force a refresh of the continuous aggregate
+CALL refresh_continuous_aggregate('test_cagg', NULL, interval '1 hour');
+
+--check materialization log, it will have a row of [-9223372036854775808, -210866803200000001],
+--that is [-infinity, CAGG_INVALIDATION_WRONG_GREATEST_VALUE]
+
+SELECT lowest_modified_value, greatest_modified_value 
+FROM _timescaledb_catalog.continuous_aggs_materialization_invalidation_log
+WHERE materialization_id = (SELECT mat_hypertable_id FROM _timescaledb_catalog.continuous_agg 
+                            WHERE user_view_name = 'test_cagg');
+
+--now insert some data that would trigger incremental refresh
+INSERT INTO test_metrics (time, device_id, value)
+    VALUES 
+        ('2025-08-05 15:00:00-05', 1, 10.0),
+        ('2025-08-05 19:00:00-05', 1, 20.0);
+
+SELECT add_continuous_aggregate_policy('test_cagg',
+  start_offset => NULL,
+  end_offset => INTERVAL '1 hour',
+  schedule_interval => INTERVAL '5 minute');
+
+ --make the policy run and check the log
+ --before the fix in https://github.com/timescale/timescaledb/pull/8476 this would result
+ --in a crash of failed Assert("refresh_window->end > result.start") on debug build,
+ --or "Timestamp out of range" error on release build
+ --After the fix, it will run successfully
+TRUNCATE bgw_log;
+SELECT ts_bgw_params_reset_time(0, true);
+SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25);
+SELECT * FROM sorted_bgw_log;
+
+--clean up
+DROP TABLE test_metrics cascade;
